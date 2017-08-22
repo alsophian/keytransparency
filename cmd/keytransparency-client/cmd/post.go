@@ -68,7 +68,7 @@ User email MUST match the OAuth account used to authorize the update.
 		timeout := viper.GetDuration("timeout")
 
 		// Create client.
-		c, err := GetClient(viper.GetString("client-secret"))
+		c, err := GetClient(true)
 		if err != nil {
 			return fmt.Errorf("error connecting: %v", err)
 		}
@@ -89,7 +89,7 @@ User email MUST match the OAuth account used to authorize the update.
 		if _, err := c.Update(ctx, userID, appID, profileData, signers, authorizedKeys); err != nil {
 			return fmt.Errorf("update failed: %v", err)
 		}
-		fmt.Printf("New key for %v: %x", userID, data)
+		fmt.Printf("New key for %v: %x\n", userID, data)
 		return nil
 	},
 }

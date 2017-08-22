@@ -28,39 +28,27 @@ milestones](https://github.com/google/keytransparency/milestones) under
 development.
 
 
-## Using the Key Transparency Client
+## Key Transparency Client
 
-1. Install [Go](https://golang.org/doc/install) 1.7.
-Set `$GOPATH` variable to point to your Go workspace directory and add `$GOPATH/bin` to the `$PATH` variable.
+### Setup
+1. Install [Go 1.7](https://golang.org/doc/install).
+2. `go get -u github.com/google/keytransparency/cmd/keytransparency-client `
+3. Get an [OAuth client ID](https://console.developers.google.com/apis/credentials) and download the generated JSON file to `client_secret.json`.
 
-2. Install prerequisites, Key Transparency client code, and sync all dependencies
+### Client operations
 
-  ```sh
-  go get -u github.com/google/keytransparency/cmd/...
-  ```
-
-3. Get an [OAuth client ID](https://console.developers.google.com/apis/credentials) and download the generated JSON file.
-
-4. Run the client setup tool
+#### Publish a public key
 
   ```sh
-  ./scripts/prepare_client.sh
+  keytransparency-client authorized-keys --help 
+  keytransparency-client authorized-keys add --generate --type=ecdsa --activate
+  keytransparency-client post user@domain.com app1 --client-secret=client_secret.json --insecure -d 'dGVzdA==' #Base64
   ```
 
-5. Set/Update a user's keys. 
-
-  ```sh
-  ./keytransparency-client authorized-keys add --generate --type=ecdsa --activate
-  ./keytransparency-client post user@domain.com app1 -d 'dGVzdA==' --config=./.keytransparency.yaml
-  ```
-  Key material is base64 encoded, e.g., 'dGVzdA==' is 'test' encoded.
-
-  Note: Use `./keytransparency-client authorized-keys --help` for more information about authorized key managements.
-
-6. Fetch and verify a user's keys:
+#### Get and verify a public key
 
   ```
-  ./keytransparency-client get <email> --config=.keytransparency.yaml --verbose
+  keytransparency-client get <email> <app> --insecure --verbose
   ✓ Commitment verified.
   ✓ VRF verified.
   ✓ Sparse tree proof verified.
@@ -73,64 +61,44 @@ Set `$GOPATH` variable to point to your Go workspace directory and add `$GOPATH/
   keys:<key:"app1" value:"test" >
   ```
 
+#### Verify key history
   ```
-  ./keytransparency-client history <email> --config=.keytransparency.yaml
+  keytransparency-client history <email> --insecure
   Epoch |Timestamp                    |Profile
   4     |Mon Sep 12 22:23:54 UTC 2016 |keys:<key:"app1" value:"test" >
   ```
 
 
-## Running a Key Transparency Cluster
+## Running the server
 
-1. Install 
-- [Etcd v3.1.3](https://github.com/coreos/etcd/releases/tag/v3.1.3).
-- [OpenSSL](https://www.openssl.org/community/binaries.html)
-- [Docker](https://docs.docker.com/engine/installation/) 
-  - Docker Engine 1.13.0+ `docker version -f '{{.Server.APIVersion}}'`
-  - Docker Compose 1.11.0+ `docker-compose --version`
+### Install 
+1. [OpenSSL](https://www.openssl.org/community/binaries.html)
+1. [Docker](https://docs.docker.com/engine/installation/) 
+   - Docker Engine 1.13.0+ `docker version -f '{{.Server.APIVersion}}'`
+   - Docker Compose 1.11.0+ `docker-compose --version`
+1. `go get -u github.com/google/keytransparency/...`
+1. `go get -u github.com/google/trillian/...`
+1. `./scripts/prepare_server.sh -f` 
 
-2. Install Key Transparency
-
-  ```sh
-  go get -u github.com/google/keytransparency/...
-  go get -u github.com/google/trillian/...
-  ```
-
-4. Get a [service account key](https://console.developers.google.com/apis/credentials) and download the generated JSON file.
-
-  The service account key is used to verify client OAuth tokens.
-
-5. Run server setup 
+### Run
+1. Start Trillian
 
   ```sh
-./scripts/prepare_server.sh
+$ docker-compose up -d trillian-map trillian-log
+Creating keytransparency_db_1
+Creating  keytransparency_trillian-map_1
+Creating  keytransparency_trillian-log_1
   ```
 
-  The tool will build the server binaries, generate keys, and configure the server.
-  Clients will need the following public keys in order to verify server responses:
-
-  - `genfiles/vrf-pubkey.pem`
-  - `genfiles/server.crt`
-  - `genfile/p256-pubkey.pem`
-
-6. Run the trillian-map server 
-
-  ```sh
-docker-compose up -d trillian-map
-  ```
-
-7. Provision a log and a map 
+2. Provision a log and a map 
 ```sh
-MAP_IP=`docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' keytransparency_trillian-map_1`
-go run $GOPATH/src/github.com/google/trillian/cmd/createtree/main.go --admin_server=$MAP_IP:8090 --pem_key_path=testdata/log-rpc-server.privkey.pem --pem_key_password="towel" --signature_algorithm=ECDSA --tree_type=LOG
-go run $GOPATH/src/github.com/google/trillian/cmd/createtree/main.go --admin_server=$MAP_IP:8090 --pem_key_path=testdata/log-rpc-server.privkey.pem --pem_key_password="towel" --signature_algorithm=ECDSA --tree_type=MAP
+source scripts/configure_trillian.sh && createLog && createMap
 ```
 
-Set the `LOG_ID` and `MAP_ID` environment variables in `docker-compose.yml` with the output
-of the respective commands.
-
-8. Launch the rest of the cluster and observe.
+3. Run Key Transparency
 - `docker-compose up -d`
 - `docker-compose logs --tail=0 --follow`
-- [https://localhost:8080/v1/users/foo@bar.com](https://localhost:8080/v1/users/foo@bar.com)
+- [https://localhost:8080/v1/users/foo@bar.com?app_id=app1](https://localhost:8080/v1/users/foo@bar.com?app_id=app1)
+- [https://localhost:8080/v1/domain/info](https://localhost:8080/v1/domain/info)
+- [Prometheus graphs](http://localhost:9090/graph)
 

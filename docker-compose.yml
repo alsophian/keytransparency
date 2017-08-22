@@ -8,6 +8,7 @@ services:
     build:
       context: .
       dockerfile: deploy/prometheus/Dockerfile
+    restart: always
     ports:
       - 9090:9090
 
@@ -32,13 +33,19 @@ services:
       dockerfile: server/trillian_log_server/Dockerfile
     restart: always
     ports:
-      - "8090:8090" # RPCs
-      - "8091:8091" # Metrics
-    environment:
-      DB_HOST: db:3306
-      DB_DATABASE: test
-      DB_USER: test
-      DB_PASSWORD: zaphod 
+      - "8090:8090" # gRPC
+      - "8091:8091" # HTTP & Metrics
+    entrypoint:
+      - /go/bin/trillian_log_server
+      - --mysql_uri=test:zaphod@tcp(db:3306)/test
+      - --rpc_endpoint=0.0.0.0:8090
+      - --http_endpoint=0.0.0.0:8091
+      - --alsologtostderr 
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/metrics"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
 
   trillian-log-signer:
     depends_on:
@@ -49,13 +56,22 @@ services:
       dockerfile: server/trillian_log_signer/Dockerfile
     restart: always
     ports:
-      - "8092:8091" # Metrics
-    environment:
-      DB_HOST: db:3306
-      DB_DATABASE: test
-      DB_USER: test
-      DB_PASSWORD: zaphod
-
+      - "8092:8091" # HTTP & Metrics
+    entrypoint: 
+      - /go/bin/trillian_log_signer
+      - --mysql_uri=test:zaphod@tcp(db:3306)/test
+      - --http_endpoint=0.0.0.0:8091
+      - --sequencer_guard_window=0s
+      - --sequencer_interval=1s
+      - --num_sequencers=1
+      - --batch_size=50
+      - --force_master=true
+      - --alsologtostderr
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/metrics"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
 
   trillian-map:
     depends_on:
@@ -66,13 +82,19 @@ services:
       dockerfile: server/trillian_map_server/Dockerfile
     restart: always
     ports:
-      - "8093:8090" # RPCs
-      - "8094:8091" # Metrics
-    environment:
-      DB_HOST: db:3306
-      DB_DATABASE: test
-      DB_USER: test
-      DB_PASSWORD: zaphod 
+      - "8093:8090" # gRPC
+      - "8094:8091" # HTTP & Metrics
+    entrypoint:
+      - /go/bin/trillian_map_server
+      - --mysql_uri=test:zaphod@tcp(db:3306)/test
+      - --rpc_endpoint=0.0.0.0:8090
+      - --http_endpoint=0.0.0.0:8091
+      - --alsologtostderr 
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/metrics"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
 
   kt-server:
     depends_on:
@@ -80,28 +102,31 @@ services:
       - trillian-log
       - trillian-map
     build:
-      context: .
-      dockerfile: ./cmd/keytransparency-server/Dockerfile
+      context: ..
+      dockerfile: ./keytransparency/cmd/keytransparency-server/Dockerfile
     image: us.gcr.io/key-transparency/keytransparency-server
     restart: always
     ports:
       - "8080:8080" # json & grpc
       - "8081:8081" # metrics
-    environment:
-      LOG_ID: 4450861294505218766 # Update with trillian admin CLI.
-      LOG_URL: trillian-log:8090
-      MAP_ID: 5698043027494814677 # Update with trillian admin CLI.
-      MAP_URL: trillian-map:8090
-      DB_HOST: db:3306
-      DB_DATABASE: test
-      DB_USER: test
-      DB_PASSWORD: zaphod
-      GOOGLE_APPLICATION_CREDENTIALS: /kt/service_key.json
-      CERT: /kt/server.crt
-      VRF_PRIV: /kt/vrf-key.pem
-      VRF_PUB: /kt/vrf-pubkey.pem
-      TLS_KEY_PATH: /kt/server.key
-      TLS_CRT_PATH: /kt/server.crt
+    entrypoint:
+      - /go/bin/keytransparency-server
+      - --addr=0.0.0.0.:8080
+      - --db=test:zaphod@tcp(db:3306)/test
+      - --log-id=$LOG_ID
+      - --log-url=trillian-log:8090
+      - --map-id=$MAP_ID
+      - --map-url=trillian-map:8090
+      - --vrf=/kt/vrf-key.pem
+      - --tls-key=/kt/server.key
+      - --tls-cert=/kt/server.crt
+      - --alsologtostderr
+      - --v=5
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/debug/var"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
   kt-signer:
     depends_on:
@@ -109,20 +134,18 @@ services:
       - trillian-log
       - trillian-map
     build:
-      context: ../.
-      dockerfile: ./keytransparency/cmd/keytransparency-signer/Dockerfile
-    image: us.gcr.io/key-transparency/keytransparency-signer
+      context: ..
+      dockerfile: ./keytransparency/cmd/keytransparency-sequencer/Dockerfile
+    image: us.gcr.io/key-transparency/keytransparency-sequencer
     restart: always
-    environment:
-      LOG_ID: 4450861294505218766 # Update with trillian admin CLI.
-      LOG_URL: trillian-log:8090
-      MAP_ID: 5698043027494814677 # Update with trillian admin CLI.
-      MAP_URL: trillian-map:8090
-      DB_HOST: db:3306
-      DB_DATABASE: test
-      DB_USER: test
-      DB_PASSWORD: zaphod
-      LOG_KEY: /trillian/log-rpc-server.pubkey.pem
-      SIGN_KEY: /trillian/log-rpc-server.privkey.pem
-      SIGN_KEY_PW: towel
-      MIN_SIGN_PERIOD: 5s
+    entrypoint:
+      - /go/bin/keytransparency-signer
+      - --db=test:zaphod@tcp(db:3306)/test
+      - --log-id=$LOG_ID
+      - --log-url=trillian-log:8090
+      - --map-id=$MAP_ID
+      - --map-url=trillian-map:8090
+      - --min-period=5s
+      - --max-period=5m
+      - --alsologtostderr
+      - --v=5

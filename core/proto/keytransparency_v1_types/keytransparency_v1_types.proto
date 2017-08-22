@@ -21,6 +21,7 @@ syntax = "proto3";
 // associated with it.
 package keytransparency.v1.types;
 
+import "crypto/keyspb/keyspb.proto";
 import "crypto/sigpb/sigpb.proto";
 import "trillian.proto";
 import "trillian_map_api.proto";
@@ -57,6 +58,10 @@ message Entry {
   bytes commitment = 1;
   // authorized_keys is the set of keys allowed to sign updates for this entry.
   repeated PublicKey authorized_keys = 2;
+  // previous contains the hash of the previous entry that this mutation is
+  // modifying creating a hash chain of all mutations. The hash used is
+  // CommonJSON in "github.com/benlaurie/objecthash/go/objecthash".
+  bytes previous = 3;
 }
 
 // PublicKey defines a key this domain uses to sign MapHeads with.
@@ -76,6 +81,7 @@ message PublicKey {
 message KeyValue {
   // key contains the map entry key.
   bytes key = 1;
+  // TODO(ismail): make proto.Any
   // value contains the map entry value.
   bytes value = 2;
 }
@@ -88,10 +94,6 @@ message SignedKV {
   // current epochs. The first proves ownership of new epoch key, and the
   // second proves that the correct owner is making this change.
   map<string, sigpb.DigitallySigned> signatures = 2;
-  // previous contains the hash of the previous entry that this mutation is
-  // modifying creating a hash chain of all mutations. The hash used is
-  // CommonJSON in "github.com/benlaurie/objecthash/go/objecthash".
-  bytes previous = 3;
 }
 
 // Mutation contains the actual mutation and the inclusion proof of the
@@ -99,8 +101,8 @@ message SignedKV {
 message Mutation {
   // update contains the actual mutation information.
   SignedKV update = 1;
-  // proof contains a leaf and an inclusion proof in the map.
-  // This is used by Storage-less monitors.
+  // proof contains a leaf and an inclusion proof in the map of the previous
+  // epoch. This is used by Storage-less monitors.
   trillian.MapLeafInclusion proof = 2;
 }
 
@@ -115,7 +117,7 @@ message GetEntryRequest {
   // app_id is the identifier for the application.
   string app_id = 2;
   // first_tree_size is the tree_size of the currently trusted log root. 
-  // Omitting this field will ommit the log consistency proof from the response.
+  // Omitting this field will omit the log consistency proof from the response.
   int64 first_tree_size = 3;
 }
 
@@ -160,7 +162,7 @@ message GetEntryResponse {
 message ListEntryHistoryRequest {
   // user_id is the user identifier.
   string user_id = 1;
-  // start is the starting epcoh.
+  // start is the starting epoch.
   int64 start = 2;
   // page_size is the maximum number of entries to return.
   int32 page_size = 3;
@@ -187,7 +189,7 @@ message UpdateEntryRequest {
   // app_id is the identifier for the application.
   string app_id = 2;
   // first_tree_size is the tree_size of the currently trusted log root. 
-  // Omitting this field will ommit the log consistency proof from the response.
+  // Omitting this field will omit the log consistency proof from the response.
   int64 first_tree_size = 3;
   // entry_update contains the user submitted update.
   EntryUpdate entry_update = 4;
@@ -205,7 +207,7 @@ message GetMutationsRequest {
   // epoch specifies the epoch number in which mutations will be returned.
   int64 epoch = 1;
   // first_tree_size is the tree_size of the currently trusted log root.
-  // Omitting this field will ommit the log consistency proof from the response.
+  // Omitting this field will omit the log consistency proof from the response.
   int64 first_tree_size = 2;
   // page_token defines the starting point for pagination. An empty
   // value means start from the beginning. A non-empty value requests the next
@@ -234,4 +236,18 @@ message GetMutationsResponse {
   // A non-zero value may be used by the client to fetch the next page of
   // results.
   string next_page_token = 7;
+}
+
+// GetDomainInfoRequest contains an empty request to query the GetDomainInfo
+// APIs.
+message GetDomainInfoRequest {}
+
+// GetDomainInfoResponse contains the results of GetDomainInfo APIs.
+message GetDomainInfoResponse {
+  // Log contains the Log-Tree's info.
+  trillian.Tree log = 1;
+  // Map contains the Map-Tree's info.
+  trillian.Tree map = 2;
+  // Vrf contains the VRF public key.
+  keyspb.PublicKey vrf = 3;
 }

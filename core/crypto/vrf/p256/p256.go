@@ -22,6 +22,7 @@ package p256
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/hmac"
@@ -33,6 +34,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+
+	"github.com/google/keytransparency/core/crypto/vrf"
 )
 
 var (
@@ -60,7 +63,7 @@ type PrivateKey struct {
 }
 
 // GenerateKey generates a fresh keypair for this VRF
-func GenerateKey() (*PrivateKey, *PublicKey) {
+func GenerateKey() (vrf.PrivateKey, vrf.PublicKey) {
 	key, err := ecdsa.GenerateKey(curve, rand.Reader)
 	if err != nil {
 		return nil, nil
@@ -74,14 +77,12 @@ func H1(m []byte) (x, y *big.Int) {
 	h := sha512.New()
 	var i uint32
 	byteLen := (params.BitSize + 7) >> 3
-	buf := make([]byte, 4)
 	for x == nil && i < 100 {
 		// TODO: Use a NIST specified DRBG.
-		binary.BigEndian.PutUint32(buf[:], i)
 		h.Reset()
-		h.Write(buf)
+		binary.Write(h, binary.BigEndian, i)
 		h.Write(m)
-		r := []byte{2} // Set point encoding to "compressed".
+		r := []byte{2} // Set point encoding to "compressed", y=0.
 		r = h.Sum(r)
 		x, y = Unmarshal(curve, r[:byteLen+1])
 		i++
@@ -96,12 +97,10 @@ func H2(m []byte) *big.Int {
 	// NIST SP 800-90A § A.5.1: Simple discard method.
 	byteLen := (params.BitSize + 7) >> 3
 	h := sha512.New()
-	buf := make([]byte, 4)
 	for i := uint32(0); ; i++ {
 		// TODO: Use a NIST specified DRBG.
-		binary.BigEndian.PutUint32(buf[:], i)
 		h.Reset()
-		h.Write(buf)
+		binary.Write(h, binary.BigEndian, i)
 		h.Write(m)
 		b := h.Sum(nil)
 		k := new(big.Int).SetBytes(b[:byteLen])
@@ -122,25 +121,28 @@ func (k PrivateKey) Evaluate(m []byte) (index [32]byte, proof []byte) {
 	ri := new(big.Int).SetBytes(r)
 
 	// H = H1(m)
-	hx, hy := H1(m)
+	Hx, Hy := H1(m)
+
+	// VRF_k(m) = [k]H
+	sHx, sHy := params.ScalarMult(Hx, Hy, k.D.Bytes())
+	vrf := elliptic.Marshal(curve, sHx, sHy) // 65 bytes.
 
 	// G is the base point
-	// s = H2(m, [r]G, [r]H)
-	gRx, gRy := params.ScalarBaseMult(r)
-	hRx, hRy := params.ScalarMult(hx, hy, r)
+	// s = H2(G, H, [k]G, VRF, [r]G, [r]H)
+	rGx, rGy := params.ScalarBaseMult(r)
+	rHx, rHy := params.ScalarMult(Hx, Hy, r)
 	var b bytes.Buffer
-	b.Write(m)
-	b.Write(elliptic.Marshal(curve, gRx, gRy))
-	b.Write(elliptic.Marshal(curve, hRx, hRy))
+	b.Write(elliptic.Marshal(curve, params.Gx, params.Gy))
+	b.Write(elliptic.Marshal(curve, Hx, Hy))
+	b.Write(elliptic.Marshal(curve, k.PublicKey.X, k.PublicKey.Y))
+	b.Write(vrf)
+	b.Write(elliptic.Marshal(curve, rGx, rGy))
+	b.Write(elliptic.Marshal(curve, rHx, rHy))
 	s := H2(b.Bytes())
 
 	// t = r−s*k mod N
 	t := new(big.Int).Sub(ri, new(big.Int).Mul(s, k.D))
 	t.Mod(t, params.N)
-
-	// VRF_k(m) = [k]H
-	vrfx, vrfy := params.ScalarMult(hx, hy, k.D.Bytes())
-	vrf := elliptic.Marshal(curve, vrfx, vrfy) // 65 bytes.
 
 	// Index = H(vrf)
 	index = sha256.Sum256(vrf)
@@ -170,30 +172,33 @@ func (pk *PublicKey) ProofToHash(m, proof []byte) (index [32]byte, err error) {
 	t := proof[32:64]
 	vrf := proof[64 : 64+65]
 
-	vrfx, vrfy := elliptic.Unmarshal(curve, vrf)
-	if vrfx == nil {
+	uHx, uHy := elliptic.Unmarshal(curve, vrf)
+	if uHx == nil {
 		return nilIndex, ErrInvalidVRF
 	}
 
 	// [t]G + [s]([k]G) = [t+ks]G
-	gTx, gTy := params.ScalarBaseMult(t)
-	pkSx, pkSy := params.ScalarMult(pk.X, pk.Y, s)
-	gTKSx, gTKSy := params.Add(gTx, gTy, pkSx, pkSy)
+	tGx, tGy := params.ScalarBaseMult(t)
+	ksGx, ksGy := params.ScalarMult(pk.X, pk.Y, s)
+	tksGx, tksGy := params.Add(tGx, tGy, ksGx, ksGy)
 
 	// H = H1(m)
 	// [t]H + [s]VRF = [t+ks]H
-	hx, hy := H1(m)
-	hTx, hTy := params.ScalarMult(hx, hy, t)
-	vSx, vSy := params.ScalarMult(vrfx, vrfy, s)
-	h1TKSx, h1TKSy := params.Add(hTx, hTy, vSx, vSy)
+	Hx, Hy := H1(m)
+	tHx, tHy := params.ScalarMult(Hx, Hy, t)
+	sHx, sHy := params.ScalarMult(uHx, uHy, s)
+	tksHx, tksHy := params.Add(tHx, tHy, sHx, sHy)
 
-	// H2(m, [t]G + [s]([k]G), [t]H + [s]VRF)
-	// = H2(m, [t+ks]G, [t+ks]H)
-	// = H2(m, [r]G, [r]H)
+	//   H2(G, H, [k]G, VRF, [t]G + [s]([k]G), [t]H + [s]VRF)
+	// = H2(G, H, [k]G, VRF, [t+ks]G, [t+ks]H)
+	// = H2(G, H, [k]G, VRF, [r]G, [r]H)
 	var b bytes.Buffer
-	b.Write(m)
-	b.Write(elliptic.Marshal(curve, gTKSx, gTKSy))
-	b.Write(elliptic.Marshal(curve, h1TKSx, h1TKSy))
+	b.Write(elliptic.Marshal(curve, params.Gx, params.Gy))
+	b.Write(elliptic.Marshal(curve, Hx, Hy))
+	b.Write(elliptic.Marshal(curve, pk.X, pk.Y))
+	b.Write(vrf)
+	b.Write(elliptic.Marshal(curve, tksGx, tksGy))
+	b.Write(elliptic.Marshal(curve, tksHx, tksHy))
 	h2 := H2(b.Bytes())
 
 	// Left pad h2 with zeros if needed. This will ensure that h2 is padded
@@ -209,7 +214,7 @@ func (pk *PublicKey) ProofToHash(m, proof []byte) (index [32]byte, err error) {
 }
 
 // NewVRFSigner creates a signer object from a private key.
-func NewVRFSigner(key *ecdsa.PrivateKey) (*PrivateKey, error) {
+func NewVRFSigner(key *ecdsa.PrivateKey) (vrf.PrivateKey, error) {
 	if *(key.Params()) != *curve.Params() {
 		return nil, ErrPointNotOnCurve
 	}
@@ -219,8 +224,13 @@ func NewVRFSigner(key *ecdsa.PrivateKey) (*PrivateKey, error) {
 	return &PrivateKey{key}, nil
 }
 
+// Public returns the corresponding public key as bytes.
+func (k PrivateKey) Public() crypto.PublicKey {
+	return &k.PublicKey
+}
+
 // NewVRFVerifier creates a verifier object from a public key.
-func NewVRFVerifier(pubkey *ecdsa.PublicKey) (*PublicKey, error) {
+func NewVRFVerifier(pubkey *ecdsa.PublicKey) (vrf.PublicKey, error) {
 	if *(pubkey.Params()) != *curve.Params() {
 		return nil, ErrPointNotOnCurve
 	}
@@ -231,7 +241,7 @@ func NewVRFVerifier(pubkey *ecdsa.PublicKey) (*PublicKey, error) {
 }
 
 // NewVRFSignerFromPEM creates a vrf private key from a PEM data structure.
-func NewVRFSignerFromPEM(b []byte) (*PrivateKey, error) {
+func NewVRFSignerFromPEM(b []byte) (vrf.PrivateKey, error) {
 	p, _ := pem.Decode(b)
 	if p == nil {
 		return nil, ErrNoPEMFound
@@ -240,7 +250,7 @@ func NewVRFSignerFromPEM(b []byte) (*PrivateKey, error) {
 }
 
 // NewVRFSignerFromRawKey returns the private key from a raw private key bytes.
-func NewVRFSignerFromRawKey(b []byte) (*PrivateKey, error) {
+func NewVRFSignerFromRawKey(b []byte) (vrf.PrivateKey, error) {
 	k, err := x509.ParseECPrivateKey(b)
 	if err != nil {
 		return nil, err
@@ -249,7 +259,7 @@ func NewVRFSignerFromRawKey(b []byte) (*PrivateKey, error) {
 }
 
 // NewVRFVerifierFromPEM creates a vrf public key from a PEM data structure.
-func NewVRFVerifierFromPEM(b []byte) (*PublicKey, error) {
+func NewVRFVerifierFromPEM(b []byte) (vrf.PublicKey, error) {
 	p, _ := pem.Decode(b)
 	if p == nil {
 		return nil, ErrNoPEMFound
@@ -258,7 +268,7 @@ func NewVRFVerifierFromPEM(b []byte) (*PublicKey, error) {
 }
 
 // NewVRFVerifierFromRawKey returns the public key from a raw public key bytes.
-func NewVRFVerifierFromRawKey(b []byte) (*PublicKey, error) {
+func NewVRFVerifierFromRawKey(b []byte) (vrf.PublicKey, error) {
 	k, err := x509.ParsePKIXPublicKey(b)
 	if err != nil {
 		return nil, err

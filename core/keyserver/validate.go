@@ -69,7 +69,7 @@ func validateKey(userID, appID string, key []byte) error {
 }
 
 // validateUpdateEntryRequest verifies
-// - Commitment in SignedEntryUpdate maches the serialized profile.
+// - Commitment in SignedEntryUpdate matches the serialized profile.
 // - Profile is a valid.
 func validateUpdateEntryRequest(in *tpb.UpdateEntryRequest, vrfPriv vrf.PrivateKey) error {
 	kv := in.GetEntryUpdate().GetUpdate().GetKeyValue()
@@ -92,7 +92,7 @@ func validateUpdateEntryRequest(in *tpb.UpdateEntryRequest, vrfPriv vrf.PrivateK
 	if got, want := len(committed.Key), MinNonceLen; got < want {
 		return ErrCommittedKeyLen
 	}
-	if err := commitments.Verify(in.UserId, in.AppId, entry.Commitment, committed); err != nil {
+	if err := commitments.Verify(in.UserId, in.AppId, entry.Commitment, committed.Data, committed.Key); err != nil {
 		return err
 	}
 

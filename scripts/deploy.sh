@@ -4,43 +4,52 @@
 # Following assumptions are made by this script:                               #
 # * gcloud, docker, and docker-compose is installed                            #
 # * it is called from $GOPATH/src/github.com/google/keytransparency            #
-# * there is a project called key-transparency on gce which has a cluster      #
-#   called "ci-cluster" within the "us-central1-a" compute zone                #
-# * there is a service key to authenticate with glcoud to above project in     #
-#   $GOPATH/src/github.com/google/keytransparency/service_key.json             #
+# * there is a project called key-transparency on gce  which has has gke       #
+#   enabled and a cluster configured; gcloud is already set to this            #
+#   project via:                                                               #
+#   # see gcloud help auth and authenticate, then:                             #
+#   gcloud config set project key-transparency                                 #
+#   gcloud container clusters get-credentials <your-cluster-name>              #
+#   gcloud config set compute/zone <your-compute-zone>                         #
+#                                                                              #
+#   See the project's .travis.yml file for a working example.                  #
+#                                                                              #
 ################################################################################
 
 PROJECT_NAME=key-transparency
-NAME_SPACE=default
 
 MAX_RETRY=30
 
+dir="$(dirname "$0")"
+# Import createTree commands:
+source ${dir}/configure_trillian.sh
+
 function main()
 {
+  checkCmdsAvailable
   # create key-pairs:
   ./scripts/prepare_server.sh -f
-  initGcloud
+  prepareSecrets
   buildDockerImgs
-  tearDown
   pushTrillianImgs
 
-  # Deploy all trillian related services:
+  # Deploy all trillian related services.
+  # the following line only restarts the DB if its config changed:
+  kubectl apply -f deploy/kubernetes/db-deployment.yml
   kubectl apply -f deploy/kubernetes/trillian-deployment.yml
 
   pushKTImgs
   waitForTrillian
   createTreeAndSetIDs
 
+  # Need to (re)build kt-signer after writing the public-keys
+  docker-compose build kt-signer
+  gcloud docker -- push us.gcr.io/key-transparency/keytransparency-sequencer
+
   # Deploy all keytransparency related services (server and signer):
   kubectl apply -f deploy/kubernetes/keytransparency-deployment.yml
 }
 
-function initGcloud()
-{
-  gcloud config set project ${PROJECT_NAME}
-  gcloud config set compute/zone us-central1-a
-  gcloud container clusters get-credentials ci-cluster
-}
 
 function buildDockerImgs()
 {
@@ -64,7 +73,7 @@ function pushTrillianImgs()
 
 function pushKTImgs()
 {
-  images=("keytransparency-server" "keytransparency-signer" "prometheus")
+  images=("keytransparency-server" "prometheus")
   for DOCKER_IMAGE_NAME in "${images[@]}"
   do
     # Push the images as we refer to them in the kubernetes config files:
@@ -102,11 +111,9 @@ function createTreeAndSetIDs()
   until [ -n "$LOG_ID" ] || [  $COUNTER -gt $MAX_RETRY ]; do
     # RPC was not available yet, wait and retry:
     sleep 10;
-    let COUNTER+=1
-    # get the currentl trillian-map pod:
-    MAPSRV=$(kubectl get pods --selector=run=trillian-map -o jsonpath={.items[*].metadata.name});
-    LOG_ID=$(echo 'go run $GOPATH/src/github.com/google/trillian/cmd/createtree/main.go --admin_server=localhost:8090 --pem_key_path=testdata/log-rpc-server.privkey.pem --pem_key_password="towel" --signature_algorithm=ECDSA --tree_type=LOG' | kubectl exec -i $MAPSRV -- /bin/sh )
-    MAP_ID=$(echo 'go run $GOPATH/src/github.com/google/trillian/cmd/createtree/main.go --admin_server=localhost:8090 --pem_key_path=testdata/log-rpc-server.privkey.pem --pem_key_password="towel" --signature_algorithm=ECDSA --tree_type=MAP' | kubectl exec -i $MAPSRV -- /bin/sh )
+    let COUNTER+=1;
+    export LOCAL=false;
+    createLog && createMap
   done
 
   if [ -n "$LOG_ID" ] && [ -n "$MAP_ID" ]; then
@@ -120,11 +127,23 @@ function createTreeAndSetIDs()
   fi
 }
 
-function tearDown()
+function checkCmdsAvailable()
 {
-  kubectl delete --all services --namespace=$NAME_SPACE
-  kubectl delete --all deployments --namespace=$NAME_SPACE
-  kubectl delete --all pods --namespace=$NAME_SPACE
+  if ! type jq > /dev/null 2>&1;
+    then echo "Please install jq. See: https://stedolan.github.io/jq/download/"
+    exit 1
+  fi
+}
+
+function prepareSecrets()
+{
+  local EXISTS=0
+  # if kt-secrets does not exist, create it:
+  kubectl get secret kt-secrets
+  # kubectl exits with 1 if kt-secret does not exist
+  if [ $? -ne 0 ]; then
+    kubectl create secret generic kt-secrets --from-file=genfiles/server.crt --from-file=genfiles/server.key --from-file=genfiles/vrf-key.pem
+  fi
 }
 
 # Run everything:

@@ -21,9 +21,10 @@ import (
 
 	"github.com/google/keytransparency/core/authentication"
 
+	"net/http"
+
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 	gAPI "google.golang.org/api/oauth2/v2"
 	"google.golang.org/grpc/metadata"
 )
@@ -53,35 +54,22 @@ type GAuth struct {
 
 // NewGoogleAuth creates a new authenticator for Google users.
 func NewGoogleAuth() (*GAuth, error) {
-	//httpClient := a.config.Client(ctx, token)
-	ctx := context.TODO()
-	httpClient, err := google.DefaultClient(ctx, gAPI.UserinfoEmailScope)
-	if err != nil {
-		return nil, err
-	}
-	googleService, err := gAPI.New(httpClient)
+	googleService, err := gAPI.New(http.DefaultClient)
 	if err != nil {
 		return nil, err
 	}
 	return &GAuth{googleService}, nil
 }
 
-// ValidateCreds verifies that email is equal to the validated email address
-// associated with the access token in the authorization header in ctx.
-func (a *GAuth) ValidateCreds(ctx context.Context, email string) error {
+// ValidateCreds authenticate the information present in ctx.
+func (a *GAuth) ValidateCreds(ctx context.Context) (*authentication.SecurityContext, error) {
 	// Get Tokeninfo from credentials.
 	tokenInfo, err := a.validateToken(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !tokenInfo.VerifiedEmail {
-		return ErrEmailNotVerified
-	}
-
-	// Validate email address. TODO: is email canonicalized?
-	if got, want := tokenInfo.Email, email; got != want {
-		log.Printf("auth: wrong user. got: %v, want %v", got, want)
-		return authentication.ErrWrongUser
+		return nil, ErrEmailNotVerified
 	}
 
 	// Validate scopes.
@@ -89,9 +77,9 @@ func (a *GAuth) ValidateCreds(ctx context.Context, email string) error {
 	diff := setDifference(RequiredScopes, scopes)
 	if len(diff) > 0 {
 		log.Printf("Failed auth: missing scopes %v", diff)
-		return ErrMissingScope
+		return nil, ErrMissingScope
 	}
-	return nil
+	return authentication.NewSecurityContext(tokenInfo.Email), nil
 }
 
 // setDifference returns all the elements of A that are not elements of B.

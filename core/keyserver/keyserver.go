@@ -17,17 +17,21 @@ package keyserver
 
 import (
 	"github.com/google/keytransparency/core/authentication"
+	"github.com/google/keytransparency/core/authorization"
 	"github.com/google/keytransparency/core/crypto/commitments"
 	"github.com/google/keytransparency/core/crypto/vrf"
 	"github.com/google/keytransparency/core/mutator"
+	"github.com/google/keytransparency/core/mutator/entry"
 	"github.com/google/keytransparency/core/transaction"
 
 	"github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
+	"github.com/google/trillian/crypto/keys/der"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
+	authzpb "github.com/google/keytransparency/core/proto/authorization"
 	tpb "github.com/google/keytransparency/core/proto/keytransparency_v1_types"
 	"github.com/google/trillian"
 )
@@ -47,8 +51,10 @@ type Server struct {
 	tlog      trillian.TrillianLogClient
 	mapID     int64
 	tmap      trillian.TrillianMapClient
+	tadmin    trillian.TrillianAdminClient
 	committer commitments.Committer
 	auth      authentication.Authenticator
+	authz     authorization.Authorization
 	vrf       vrf.PrivateKey
 	mutator   mutator.Mutator
 	factory   transaction.Factory
@@ -60,10 +66,12 @@ func New(logID int64,
 	tlog trillian.TrillianLogClient,
 	mapID int64,
 	tmap trillian.TrillianMapClient,
+	tadmin trillian.TrillianAdminClient,
 	committer commitments.Committer,
 	vrf vrf.PrivateKey,
 	mutator mutator.Mutator,
 	auth authentication.Authenticator,
+	authz authorization.Authorization,
 	factory transaction.Factory,
 	mutations mutator.Mutation) *Server {
 	return &Server{
@@ -71,10 +79,12 @@ func New(logID int64,
 		tlog:      tlog,
 		mapID:     mapID,
 		tmap:      tmap,
+		tadmin:    tadmin,
 		committer: committer,
 		vrf:       vrf,
 		mutator:   mutator,
 		auth:      auth,
+		authz:     authz,
 		factory:   factory,
 		mutations: mutations,
 	}
@@ -87,13 +97,34 @@ func (s *Server) GetEntry(ctx context.Context, in *tpb.GetEntryRequest) (*tpb.Ge
 	return s.getEntry(ctx, in.UserId, in.AppId, in.FirstTreeSize, -1)
 }
 
-func (s *Server) getEntry(ctx context.Context, userID, appID string, firstTreeSize, epoch int64) (*tpb.GetEntryResponse, error) {
+func (s *Server) getEntry(ctx context.Context, userID, appID string, firstTreeSize, revision int64) (*tpb.GetEntryResponse, error) {
+	if revision == 0 {
+		return nil, grpc.Errorf(codes.InvalidArgument,
+			"Epoch 0 is inavlid. The first map revision is epoch 1.")
+	}
+
+	// Fresh Root.
+	logRoot, err := s.tlog.GetLatestSignedLogRoot(ctx,
+		&trillian.GetLatestSignedLogRootRequest{
+			LogId: s.logID,
+		})
+	if err != nil {
+		glog.Errorf("tlog.GetLatestSignedLogRoot(%v): %v", s.logID, err)
+		return nil, grpc.Errorf(codes.Internal, "Cannot fetch SignedLogRoot")
+	}
+	// Use the log as the athoritative source of the latest revision.
+	if revision < 0 {
+		// The maximum index in the log is one minus the number of items in the log.
+		revision = logRoot.GetSignedLogRoot().GetTreeSize() - 1
+	}
+
+	// VRF.
 	index, proof := s.vrf.Evaluate(vrf.UniqueID(userID, appID))
 
 	getResp, err := s.tmap.GetLeaves(ctx, &trillian.GetMapLeavesRequest{
 		MapId:    s.mapID,
 		Index:    [][]byte{index[:]},
-		Revision: epoch,
+		Revision: revision,
 	})
 	if err != nil {
 		glog.Errorf("GetLeaves(): %v", err)
@@ -114,26 +145,21 @@ func (s *Server) getEntry(ctx context.Context, userID, appID string, firstTreeSi
 			return nil, grpc.Errorf(codes.Internal, "Cannot unmarshal entry")
 		}
 
-		committed, err = s.committer.Read(ctx, entry.Commitment)
+		data, nonce, err := s.committer.Read(ctx, entry.Commitment)
 		if err != nil {
 			glog.Errorf("Cannot read committed value: %v", err)
 			return nil, grpc.Errorf(codes.Internal, "Cannot read committed value")
 		}
-		if committed == nil {
+		if data == nil {
 			return nil, grpc.Errorf(codes.NotFound, "Commitment %v not found", entry.Commitment)
+		}
+		committed = &tpb.Committed{
+			Key:  nonce,
+			Data: data,
 		}
 	}
 
 	// Fetch log proofs.
-	// Fresh Root.
-	logRoot, err := s.tlog.GetLatestSignedLogRoot(ctx,
-		&trillian.GetLatestSignedLogRootRequest{
-			LogId: s.logID,
-		})
-	if err != nil {
-		glog.Errorf("tlog.GetLatestSignedLogRoot(%v): %v", s.logID, err)
-		return nil, grpc.Errorf(codes.Internal, "Cannot fetch SignedLogRoot")
-	}
 	secondTreeSize := logRoot.GetSignedLogRoot().GetTreeSize()
 
 	// Consistency proof.
@@ -157,6 +183,7 @@ func (s *Server) getEntry(ctx context.Context, userID, appID string, firstTreeSi
 		&trillian.GetInclusionProofRequest{
 			LogId: s.logID,
 			// SignedMapRoot must be placed in the log at MapRevision.
+			// MapRevisions start at 1. Log leaves start at 1.
 			LeafIndex: getResp.GetMapRoot().GetMapRevision(),
 			TreeSize:  secondTreeSize,
 		})
@@ -226,16 +253,20 @@ func (s *Server) ListEntryHistory(ctx context.Context, in *tpb.ListEntryHistoryR
 // profile will be created.
 func (s *Server) UpdateEntry(ctx context.Context, in *tpb.UpdateEntryRequest) (*tpb.UpdateEntryResponse, error) {
 	// Validate proper authentication.
-	switch err := s.auth.ValidateCreds(ctx, in.UserId); err {
+	sctx, err := s.auth.ValidateCreds(ctx)
+	switch err {
 	case nil:
 		break // Authentication succeeded.
-	case authentication.ErrWrongUser:
-		return nil, grpc.Errorf(codes.PermissionDenied, "Permission denied")
 	case authentication.ErrMissingAuth:
 		return nil, grpc.Errorf(codes.Unauthenticated, "Missing authentication header")
 	default:
 		glog.Warningf("Auth failed: %v", err)
 		return nil, grpc.Errorf(codes.Unauthenticated, "Unauthenticated")
+	}
+	// Validate proper authorization.
+	if s.authz.IsAuthorized(sctx, s.mapID, in.AppId, in.UserId, authzpb.Permission_WRITE) != nil {
+		glog.Warningf("Authz failed: %v", err)
+		return nil, grpc.Errorf(codes.PermissionDenied, "Unauthorized")
 	}
 	// Verify:
 	// - Index to Key equality in SignedKV.
@@ -263,19 +294,19 @@ func (s *Server) UpdateEntry(ctx context.Context, in *tpb.UpdateEntryRequest) (*
 	}
 
 	// Catch errors early. Perform mutation verification.
-	// Read at the current value.  Assert the following:
+	// Read at the current value. Assert the following:
 	// - Correct signatures from previous epoch.
 	// - Correct signatures internal to the update.
 	// - Hash of current data matches the expectation in the mutation.
 
-	m, err := proto.Marshal(in.GetEntryUpdate().GetUpdate())
+	// The very first mutation will have resp.LeafProof.MapLeaf.LeafValue=nil.
+	oldLeafB := resp.GetLeafProof().GetLeaf().GetLeafValue()
+	oldEntry, err := entry.FromLeafValue(oldLeafB)
 	if err != nil {
-		glog.Warningf("Marshal error of Update: %v", err)
-		return nil, grpc.Errorf(codes.InvalidArgument, "Marshaling error")
+		glog.Errorf("entry.FromLeafValue: %v", err)
+		return nil, grpc.Errorf(codes.InvalidArgument, "invalid previous leaf value")
 	}
-
-	// The very first mutation will have resp.LeafProof.LeafData=nil.
-	if err := s.mutator.CheckMutation(resp.LeafProof.Leaf.LeafValue, m); err == mutator.ErrReplay {
+	if _, err := s.mutator.Mutate(oldEntry, in.GetEntryUpdate().GetUpdate()); err == mutator.ErrReplay {
 		glog.Warningf("Discarding request due to replay")
 		// Return the response. The client should handle the replay case
 		// by comparing the returned response with the request. Check
@@ -305,6 +336,37 @@ func (s *Server) UpdateEntry(ctx context.Context, in *tpb.UpdateEntryRequest) (*
 	return &tpb.UpdateEntryResponse{Proof: resp}, nil
 }
 
+// GetDomainInfo returns all info tied to the specified domain.
+//
+// This API to get all necessary data needed to verify a particular
+// key-server. Data contains for instance the tree-info, like for instance the
+// log-/map-id and the corresponding public-keys.
+func (s *Server) GetDomainInfo(ctx context.Context, in *tpb.GetDomainInfoRequest) (*tpb.GetDomainInfoResponse, error) {
+	logTree, err := s.tadmin.GetTree(ctx, &trillian.GetTreeRequest{
+		TreeId: s.logID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	mapTree, err := s.tadmin.GetTree(ctx, &trillian.GetTreeRequest{
+		TreeId: s.mapID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	vrfPubKeyPB, err := der.ToPublicProto(s.vrf.Public())
+	if err != nil {
+		return nil, err
+	}
+
+	return &tpb.GetDomainInfoResponse{
+		Log: logTree,
+		Map: mapTree,
+		Vrf: vrfPubKeyPB,
+	}, nil
+}
+
 func (s *Server) saveCommitment(ctx context.Context, kv *tpb.KeyValue, committed *tpb.Committed) error {
 	entry := new(tpb.Entry)
 	if err := proto.Unmarshal(kv.Value, entry); err != nil {
@@ -313,7 +375,7 @@ func (s *Server) saveCommitment(ctx context.Context, kv *tpb.KeyValue, committed
 	}
 
 	// Write the commitment.
-	if err := s.committer.Write(ctx, entry.Commitment, committed); err != nil {
+	if err := s.committer.Write(ctx, entry.Commitment, committed.Data, committed.Key); err != nil {
 		glog.Errorf("committer.Write failed: %v", err)
 		return grpc.Errorf(codes.Internal, "Write failed")
 	}

@@ -29,13 +29,13 @@ import (
 	"github.com/google/keytransparency/core/client/kt"
 	"github.com/google/keytransparency/core/crypto/signatures"
 	"github.com/google/keytransparency/core/crypto/vrf"
+	"github.com/google/keytransparency/core/crypto/vrf/p256"
 	"github.com/google/keytransparency/core/mutator"
 	"github.com/google/keytransparency/core/mutator/entry"
-	"github.com/google/keytransparency/core/tree/sparse"
-	tv "github.com/google/keytransparency/core/tree/sparse/verifier"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/google/trillian/client"
+	"github.com/google/trillian/crypto/keys/der"
+	"github.com/google/trillian/merkle/hashers"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
@@ -49,15 +49,12 @@ const (
 	// keys. Assuming 2 keys per profile (each of size 2048-bit), a page of
 	// size 16 will contain about 8KB of data.
 	pageSize = 16
-	// The default capacity used when creating a profiles list in
-	// ListHistory.
-	defaultListCap = 10
 	// TODO: Public keys of trusted monitors.
 )
 
 var (
 	// ErrRetry occurs when an update request has been submitted, but the
-	// results of the udpate are not visible on the server yet. The client
+	// results of the update are not visible on the server yet. The client
 	// must retry until the request is visible.
 	ErrRetry = errors.New("update not present on server yet")
 	// ErrIncomplete occurs when the server indicates that requested epochs
@@ -83,24 +80,58 @@ type Client struct {
 	cli        spb.KeyTransparencyServiceClient
 	vrf        vrf.PublicKey
 	kt         *kt.Verifier
-	log        client.LogVerifier
 	mutator    mutator.Mutator
 	RetryCount int
 	RetryDelay time.Duration
 	trusted    trillian.SignedLogRoot
 }
 
+// NewFromConfig creates a new client from a config
+func NewFromConfig(cc *grpc.ClientConn, config *tpb.GetDomainInfoResponse) (*Client, error) {
+	// Log Hasher.
+	logHasher, err := hashers.NewLogHasher(config.GetLog().GetHashStrategy())
+	if err != nil {
+		return nil, fmt.Errorf("Failed creating LogHasher: %v", err)
+	}
+
+	// Log Key
+	logPubKey, err := der.UnmarshalPublicKey(config.GetLog().GetPublicKey().GetDer())
+	if err != nil {
+		return nil, fmt.Errorf("Failed parsing Log public key: %v", err)
+	}
+
+	// Map Hasher
+	mapHasher, err := hashers.NewMapHasher(config.GetMap().GetHashStrategy())
+	if err != nil {
+		return nil, fmt.Errorf("Failed creating MapHasher: %v", err)
+	}
+
+	// Map Key
+	mapPubKey, err := der.UnmarshalPublicKey(config.GetMap().GetPublicKey().GetDer())
+	if err != nil {
+		return nil, fmt.Errorf("Failed parsing Map public key: %v", err)
+	}
+
+	// VRF key
+	vrfPubKey, err := p256.NewVRFVerifierFromRawKey(config.GetVrf().GetDer())
+	if err != nil {
+		return nil, fmt.Errorf("Error parsing vrf public key: %v", err)
+	}
+
+	logVerifier := client.NewLogVerifier(logHasher, logPubKey)
+	return New(cc, vrfPubKey, mapPubKey, mapHasher, logVerifier), nil
+}
+
 // New creates a new client.
-func New(mapID int64,
-	client spb.KeyTransparencyServiceClient,
+func New(cc *grpc.ClientConn,
 	vrf vrf.PublicKey,
-	verifier crypto.PublicKey,
-	log client.LogVerifier) *Client {
+	mapPubKey crypto.PublicKey,
+	mapHasher hashers.MapHasher,
+	logVerifier client.LogVerifier) *Client {
 	return &Client{
-		cli:        client,
+		cli:        spb.NewKeyTransparencyServiceClient(cc),
 		vrf:        vrf,
-		kt:         kt.New(vrf, tv.New(mapID, sparse.CONIKSHasher), verifier, log),
-		log:        log,
+		kt:         kt.New(vrf, mapHasher, mapPubKey, logVerifier),
 		mutator:    entry.New(),
 		RetryCount: 1,
 		RetryDelay: 3 * time.Second,
@@ -140,9 +171,14 @@ func min(x, y int32) int32 {
 // ListHistory returns a list of profiles starting and ending at given epochs.
 // It also filters out all identical consecutive profiles.
 func (c *Client) ListHistory(ctx context.Context, userID, appID string, start, end int64, opts ...grpc.CallOption) (map[*trillian.SignedMapRoot][]byte, error) {
+	if start < 0 {
+		return nil, fmt.Errorf("start=%v, want >= 0", start)
+	}
 	var currentProfile []byte
 	profiles := make(map[*trillian.SignedMapRoot][]byte)
-	for start <= end {
+	epochsReceived := int64(0)
+	epochsWant := end - start + 1
+	for epochsReceived < epochsWant {
 		resp, err := c.cli.ListEntryHistory(ctx, &tpb.ListEntryHistoryRequest{
 			UserId:   userID,
 			AppId:    appID,
@@ -152,6 +188,7 @@ func (c *Client) ListHistory(ctx context.Context, userID, appID string, start, e
 		if err != nil {
 			return nil, err
 		}
+		epochsReceived += int64(len(resp.GetValues()))
 
 		for i, v := range resp.GetValues() {
 			Vlog.Printf("Processing entry for %v, epoch %v", userID, start+int64(i))
@@ -172,9 +209,13 @@ func (c *Client) ListHistory(ctx context.Context, userID, appID string, start, e
 			currentProfile = profile
 		}
 		if resp.NextStart == 0 {
-			return nil, ErrIncomplete // No more data.
+			break // No more data.
 		}
 		start = resp.NextStart // Fetch the next block of results.
+	}
+
+	if epochsReceived < epochsWant {
+		return nil, ErrIncomplete
 	}
 
 	return profiles, nil
@@ -203,18 +244,17 @@ func (c *Client) Update(ctx context.Context, userID, appID string, profileData [
 	if err != nil {
 		return nil, fmt.Errorf("CreateUpdateEntryRequest: %v", err)
 	}
-
-	// Check the mutation before submitting it.
-	m, err := proto.Marshal(req.GetEntryUpdate().GetUpdate())
+	oldLeafB := getResp.GetLeafProof().GetLeaf().GetLeafValue()
+	oldLeaf, err := entry.FromLeafValue(oldLeafB)
 	if err != nil {
-		return nil, fmt.Errorf("proto.Marshal(): %v", err)
+		return nil, fmt.Errorf("entry.FromLeafValue: %v", err)
 	}
-	if err := c.mutator.CheckMutation(getResp.LeafProof.Leaf.LeafValue, m); err != nil {
-		return nil, fmt.Errorf("CheckMutation: %v", err)
+	if _, err := c.mutator.Mutate(oldLeaf, req.GetEntryUpdate().GetUpdate()); err != nil {
+		return nil, fmt.Errorf("Mutate: %v", err)
 	}
 
 	err = c.Retry(ctx, req)
-	// Retry submitting until an incluion proof is returned.
+	// Retry submitting until an inclusion proof is returned.
 	for i := 0; err == ErrRetry && i < c.RetryCount; i++ {
 		time.Sleep(c.RetryDelay)
 		err = c.Retry(ctx, req)
@@ -237,7 +277,7 @@ func (c *Client) Retry(ctx context.Context, req *tpb.UpdateEntryRequest) error {
 	}
 
 	// Check if the response is a replay.
-	if got, want := updateResp.GetProof().GetLeafProof().Leaf.LeafValue, req.GetEntryUpdate().GetUpdate().KeyValue.Value; !bytes.Equal(got, want) {
+	if got, want := updateResp.GetProof().GetLeafProof().Leaf.LeafValue, req.GetEntryUpdate().GetUpdate().GetKeyValue().GetValue(); !bytes.Equal(got, want) {
 		return ErrRetry
 	}
 	return nil

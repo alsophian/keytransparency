@@ -24,6 +24,7 @@ import (
 	"github.com/benlaurie/objecthash/go/objecthash"
 	"github.com/golang/protobuf/proto"
 
+	"github.com/google/keytransparency/core/mutator/entry"
 	tpb "github.com/google/keytransparency/core/proto/keytransparency_v1_types"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/sigpb"
@@ -40,15 +41,18 @@ func (v *Verifier) CreateUpdateEntryRequest(
 	if err != nil {
 		return nil, fmt.Errorf("ProofToHash(): %v", err)
 	}
-	prevEntry := new(tpb.Entry)
-	if err := proto.Unmarshal(getResp.GetLeafProof().GetLeaf().GetLeafValue(), prevEntry); err != nil {
-		return nil, fmt.Errorf("Error unmarshaling Entry from leaf proof: %v", err)
-	}
 
 	// Commit to profile.
-	commitment, committed, err := commitments.Commit(userID, appID, profileData)
+	commitmentNonce, err := commitments.GenCommitmentKey()
 	if err != nil {
 		return nil, err
+	}
+	commitment := commitments.Commit(userID, appID, profileData, commitmentNonce)
+
+	oldLeaf := getResp.GetLeafProof().GetLeaf().GetLeafValue()
+	prevEntry, err := entry.FromLeafValue(oldLeaf)
+	if err != nil {
+		return nil, fmt.Errorf("Error unmarshaling Entry from leaf proof: %v", err)
 	}
 
 	// Create new Entry.
@@ -56,9 +60,12 @@ func (v *Verifier) CreateUpdateEntryRequest(
 	if len(keys) == 0 {
 		keys = prevEntry.AuthorizedKeys
 	}
+	// TODO(ismail): Change this to plain sha256:
+	previous := objecthash.ObjectHash(prevEntry)
 	entry := &tpb.Entry{
 		Commitment:     commitment,
 		AuthorizedKeys: keys,
+		Previous:       previous[:],
 	}
 
 	// Sign Entry.
@@ -74,19 +81,20 @@ func (v *Verifier) CreateUpdateEntryRequest(
 	if err != nil {
 		return nil, err
 	}
-	previous := objecthash.ObjectHash(getResp.GetLeafProof().GetLeaf().GetLeafValue())
 	signedkv := &tpb.SignedKV{
 		KeyValue:   kv,
 		Signatures: sigs,
-		Previous:   previous[:],
 	}
 
 	return &tpb.UpdateEntryRequest{
 		UserId: userID,
 		AppId:  appID,
 		EntryUpdate: &tpb.EntryUpdate{
-			Update:    signedkv,
-			Committed: committed,
+			Update: signedkv,
+			Committed: &tpb.Committed{
+				Key:  commitmentNonce,
+				Data: profileData,
+			},
 		},
 		FirstTreeSize: trusted.TreeSize,
 	}, err

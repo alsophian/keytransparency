@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package config has utilitites for loading configuration files from disk.
+// Package config has utilities for loading configuration files from disk.
 package config
 
 import (
@@ -20,8 +20,9 @@ import (
 
 	"github.com/google/trillian"
 	"github.com/google/trillian/client"
-	"github.com/google/trillian/crypto/keys"
-	"github.com/google/trillian/merkle/objhasher"
+	"github.com/google/trillian/crypto/keys/pem"
+	"github.com/google/trillian/merkle/hashers"
+	_ "github.com/google/trillian/merkle/objhasher" // Register objecthasher
 
 	"github.com/golang/glog"
 	"google.golang.org/grpc"
@@ -29,7 +30,7 @@ import (
 
 // LogClient creates a log client.
 func LogClient(logID int64, logURL, pubKeyFile string) (client.VerifyingLogClient, error) {
-	sthPubKey, err := keys.NewFromPublicPEMFile(pubKeyFile)
+	sthPubKey, err := pem.ReadPublicKeyFile(pubKeyFile)
 	if err != nil {
 		glog.Fatalf("Failed to open public key %v: %v", pubKeyFile, err)
 	}
@@ -38,8 +39,11 @@ func LogClient(logID int64, logURL, pubKeyFile string) (client.VerifyingLogClien
 	if err != nil {
 		return nil, fmt.Errorf("Failed to connect to %v: %v", logURL, err)
 	}
-	log := client.New(logID, trillian.NewTrillianLogClient(cc),
-		objhasher.ObjectHasher, sthPubKey)
+	hasher, err := hashers.NewLogHasher(trillian.HashStrategy_OBJECT_RFC6962_SHA256)
+	if err != nil {
+		return nil, fmt.Errorf("Failed retrieving LogHasher from registry: %v", err)
+	}
+	log := client.New(logID, trillian.NewTrillianLogClient(cc), hasher, sthPubKey)
 
 	return log, nil
 }
